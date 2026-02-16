@@ -1,13 +1,17 @@
 import torch
 from unsloth import FastLanguageModel
-from rewards import parse_model_output
+from trl import GRPOTrainer, GRPOConfig
+from datasets import load_dataset
+from rewards import format_reward_func, complexity_reward_func
 import os
 
-# --- CONFIG ---
-# Validating the model we just trained with RL
-MODEL_PATH = "models/q_agent_grpo" 
+# --- CONFIGURATION ---
+# We start RL from the model we just SFT'd in Step 2
+MODEL_PATH = "models/q_agent_sft" 
+OUTPUT_DIR = "models/q_agent_grpo"
+DATA_FILE = "data/hard_questions.jsonl"
 
-# Must match the prompt used in 3_train_grpo.py EXACTLY
+# The System Prompt must match what was used in SFT (Step 2)
 SYSTEM_PROMPT = """Below is an instruction that describes a task. Write a response that completes the request.
 ### Instruction:
 You are an expert examiner. Generate a difficult multiple-choice question about Python Memory Management.
@@ -17,76 +21,79 @@ Generate a hard question.
 ### Response:
 """
 
-def verify_brain():
-    print(f"🧠 Loading RLVR-Trained Brain from: {MODEL_PATH}...")
+def train_grpo():
+    print(f"🚀 Loading SFT Model for RLVR: {MODEL_PATH}")
     
-    try:
-        model, tokenizer = FastLanguageModel.from_pretrained(
-            model_name = MODEL_PATH,
-            max_seq_length = 2048,
-            load_in_4bit = True,
-            gpu_memory_utilization = 0.6,
-        )
-        FastLanguageModel.for_inference(model)
-    except Exception as e:
-        print(f"❌ Error loading model: {e}")
-        print(f"   (Did you run 3_train_grpo.py yet?)")
-        return
-
-    print("\n🧪 STARTING STRESS TEST (5 Generations)...")
-    print("="*60)
-
-    stats = {"Clean": 0, "Rescued": 0, "Failed": 0}
-
-    # Generate 5 samples to check stability
-    for i in range(1, 6):
-        print(f"\n[Test {i}/5] Generating...")
-        
-        inputs = tokenizer([SYSTEM_PROMPT], return_tensors="pt").to("cuda")
-        
-        outputs = model.generate(
-            **inputs, 
-            max_new_tokens=1024, 
-            temperature=0.8, # Slightly high to test diversity
-            top_p=0.95,
-            repetition_penalty=1.1
-        )
-        
-        full_text = tokenizer.decode(outputs[0])
-        # Extract just the new text (the response)
-        raw_response = full_text.split("### Response:")[-1].replace("<|im_end|>", "").strip()
-
-        # --- THE VERIFIER ENGINE ---
-        # We use the EXACT same logic that gave rewards during training
-        data, is_clean = parse_model_output(raw_response)
-
-        # Reporting
-        if data and is_clean:
-            print(f"✅ PERFECT JSON")
-            stats["Clean"] += 1
-        elif data and not is_clean:
-            print(f"⚠️ BROKEN JSON (Regex Rescued)")
-            stats["Rescued"] += 1
-        else:
-            print(f"❌ GARBAGE OUTPUT")
-            stats["Failed"] += 1
-
-        # Show a snippet of what it wrote
-        preview = raw_response[:200].replace("\n", " ") + "..."
-        print(f"   Output: {preview}")
+    # 1. Load the SFT Model (The Student)
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name = MODEL_PATH,
+        max_seq_length = 2048,
+        load_in_4bit = True,
+        gpu_memory_utilization = 0.6, # Keep room for the buffer
+    )
     
-    print("\n" + "="*60)
-    print("📊 FINAL SCORECARD")
-    print(f"   - Perfect Format:  {stats['Clean']}/5")
-    print(f"   - Recoverable:     {stats['Rescued']}/5")
-    print(f"   - Total Failures:  {stats['Failed']}/5")
+    # 2. Configure LoRA for RL
+    # We need to ensure we are training the adapters, not the frozen base
+    model = FastLanguageModel.get_peft_model(
+        model,
+        r = 32, # Increase R for RL to allow more "thinking" capacity
+        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        lora_alpha = 32,
+        use_gradient_checkpointing = "unsloth",
+        random_state = 3407,
+    )
+
+    # 3. Load and Format Data
+    dataset = load_dataset("json", data_files=DATA_FILE, split="train")
+
+    # GRPO requires a 'prompt' column. We map our system prompt to it.
+    def add_prompt_column(example):
+        return {"prompt": SYSTEM_PROMPT}
     
-    if stats["Clean"] >= 4:
-        print("\n🚀 STATUS: READY FOR BATTLE. The RL training worked!")
-    elif stats["Clean"] + stats["Rescued"] >= 4:
-        print("\n⚠️ STATUS: PASSABLE. It's messy, but the interface won't crash.")
-    else:
-        print("\n🛑 STATUS: FAILURE. The model has collapsed. Tune Hyperparams.")
+    dataset = dataset.map(add_prompt_column)
+
+    print("⚔️ Initializing GRPO Trainer...")
+    
+    # 4. Define the RL Hyperparameters
+    training_args = GRPOConfig(
+        output_dir = OUTPUT_DIR,
+        learning_rate = 5e-6,           # Very low LR is critical for RL stability
+        adam_beta1 = 0.9,
+        adam_beta2 = 0.99,
+        weight_decay = 0.1,
+        warmup_ratio = 0.1,
+        lr_scheduler_type = "cosine",
+        logging_steps = 1,
+        bf16 = True,                    # Use Bfloat16 for stability if on Ampere+
+        per_device_train_batch_size = 1,
+        gradient_accumulation_steps = 4,
+        
+        # GRPO Specifics
+        num_generations = 4,            # G=4: Generate 4 answers per prompt to compare
+        max_prompt_length = 256,
+        max_completion_length = 512,    # Allow space for "Thinking"
+        max_steps = 150,                # Train longer than SFT
+        save_steps = 50,
+        report_to = "none",
+        use_vllm = True,                # Enable vLLM for fast generation (Crucial)
+    )
+
+    # 5. The Trainer
+    trainer = GRPOTrainer(
+        model = model,
+        reward_funcs = [format_reward_func, complexity_reward_func],
+        train_dataset = dataset,
+        args = training_args,
+        processing_class = tokenizer,
+    )
+    
+    print("🔥 Starting RLVR Loop...")
+    print("   (This phase generates multiple responses and scores them against each other)")
+    trainer.train()
+    
+    print(f"🏆 Saving RL-Trained Brain to {OUTPUT_DIR}")
+    model.save_pretrained(OUTPUT_DIR)
+    tokenizer.save_pretrained(OUTPUT_DIR)
 
 if __name__ == "__main__":
-    verify_brain()
+    train_grpo()
