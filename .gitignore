@@ -1,0 +1,16 @@
+# --- Environment & Models (The Big Stuff) ---
+aaipl_env/
+models/
+unsloth_compiled_cache/
+
+# --- Python Junk (Bytecode) ---
+**/__pycache__/
+*.py[cod]
+*$py.class
+
+# --- OS Junk (Metadata) ---
+.DS_Store
+Thumbs.db
+
+# --- Logs ---
+*.log
