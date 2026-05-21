@@ -151,12 +151,6 @@ python training/verify_brain_final.py
 
 ---
 
-## License
-
-This project is licensed under the **MIT License**.
-
----
-
 ## Acknowledgments
 
 * **Unsloth:** For providing the optimized kernels that make local RL training possible.
