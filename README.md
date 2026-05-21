@@ -102,11 +102,6 @@ The architecture uses an **Attacker/Defender** framework:
 ### Installation
 
 1. **Clone the Repository:**
-```sh
-git clone https://github.com/M3TAM0RPH0SIS/AI-Examiner-Reinforcemnt_learning-fine_tunning
-cd AI-Examiner-Reinforcemnt_learning-fine_tunning
-
-```
 
 
 2. **Install Dependencies:**
